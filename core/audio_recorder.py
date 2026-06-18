@@ -1,11 +1,9 @@
 import numpy as np
 import threading
-import queue
 import time
 import os
 import tempfile
 import wave
-import struct
 from typing import Optional, List, Dict, Any
 from PyQt5.QtCore import QObject, pyqtSignal
 
@@ -42,12 +40,15 @@ class AudioRecorder(QObject):
         self._temp_file: Optional[str] = None
         self._lock = threading.Lock()
 
-        self._mic_stream = None
-        self._system_stream = None
-        self._audio = pyaudio.PyAudio() if HAS_PYAUDIO else None
-
         self._mic_frames: List[bytes] = []
         self._system_frames: List[bytes] = []
+
+        self._mic_channels = 1
+        self._mic_rate = 44100
+        self._sys_channels = 2
+        self._sys_rate = 44100
+
+        self._audio = pyaudio.PyAudio() if HAS_PYAUDIO else None
 
     def set_sample_rate(self, rate: int):
         self._sample_rate = rate
@@ -72,22 +73,43 @@ class AudioRecorder(QObject):
         devices = []
         if not HAS_PYAUDIO:
             return devices
+        p = None
         try:
             p = pyaudio.PyAudio()
+            wasapi_idx = -1
+            try:
+                wasapi_idx = p.get_host_api_info_by_type(pyaudio.paWASAPI)['index']
+            except Exception:
+                pass
+
             for i in range(p.get_device_count()):
-                info = p.get_device_info_by_index(i)
-                if info['maxInputChannels'] > 0 and int(info.get('hostApi', 0)) == 0:
+                try:
+                    info = p.get_device_info_by_index(i)
+                    if info['maxInputChannels'] <= 0:
+                        continue
                     name = info['name']
-                    if 'loopback' not in name.lower() and 'stereo mix' not in name.lower() and 'what u hear' not in name.lower():
-                        devices.append({
-                            'id': i,
-                            'name': name,
-                            'channels': info['maxInputChannels'],
-                            'sample_rate': int(info['defaultSampleRate'])
-                        })
-            p.terminate()
+                    nl = name.lower()
+                    if any(kw in nl for kw in ['loopback', 'stereo mix', 'what u hear', 'wave out mix', '立体声混音', '您听到的声音']):
+                        continue
+                    host_api = int(info.get('hostApi', 0))
+                    if host_api == wasapi_idx:
+                        continue
+                    devices.append({
+                        'id': i,
+                        'name': name,
+                        'channels': info['maxInputChannels'],
+                        'sample_rate': int(info['defaultSampleRate'])
+                    })
+                except Exception:
+                    continue
         except Exception as e:
             print(f"Error listing mic devices: {e}")
+        finally:
+            if p:
+                try:
+                    p.terminate()
+                except Exception:
+                    pass
         return devices
 
     @staticmethod
@@ -95,40 +117,50 @@ class AudioRecorder(QObject):
         devices = []
         if not HAS_PYAUDIO:
             return devices
+        p = None
         try:
             p = pyaudio.PyAudio()
-            for i in range(p.get_device_count()):
-                info = p.get_device_info_by_index(i)
-                name = info['name'].lower()
-                is_loopback = ('loopback' in name or 'stereo mix' in name
-                               or 'what u hear' in name or 'wave out mix' in name
-                               or '立体声混音' in name or '您听到的声音' in name)
-
-                if info['maxInputChannels'] > 0 and is_loopback:
-                    devices.append({
-                        'id': i,
-                        'name': info['name'],
-                        'channels': info['maxInputChannels'],
-                        'sample_rate': int(info['defaultSampleRate'])
-                    })
-
+            wasapi_idx = -1
+            wasapi_default_output_idx = -1
             try:
                 wasapi_info = p.get_host_api_info_by_type(pyaudio.paWASAPI)
-                default_output = p.get_device_info_by_index(wasapi_info['defaultOutputDevice'])
-                loopback_idx = default_output['index']
+                wasapi_idx = wasapi_info['index']
+                wasapi_default_output_idx = wasapi_info['defaultOutputDevice']
+                output_info = p.get_device_info_by_index(wasapi_default_output_idx)
                 devices.insert(0, {
-                    'id': loopback_idx,
-                    'name': f"WASAPI 系统声音 ({default_output['name']}) [推荐]",
-                    'channels': 2,
-                    'sample_rate': int(default_output['defaultSampleRate']),
+                    'id': output_info['index'],
+                    'name': f"WASAPI 系统声音 ({output_info['name']}) [推荐]",
+                    'channels': min(2, int(output_info['maxOutputChannels'])),
+                    'sample_rate': int(output_info['defaultSampleRate']),
                     'wasapi_loopback': True
                 })
             except Exception as e:
-                print(f"WASAPI detection: {e}")
+                print(f"WASAPI loopback device not found: {e}")
 
-            p.terminate()
+            for i in range(p.get_device_count()):
+                try:
+                    info = p.get_device_info_by_index(i)
+                    if info['index'] == wasapi_default_output_idx:
+                        continue
+                    name = info['name'].lower()
+                    is_loopback = any(kw in name for kw in ['loopback', 'stereo mix', 'what u hear', 'wave out mix', '立体声混音', '您听到的声音'])
+                    if info['maxInputChannels'] > 0 and is_loopback:
+                        devices.append({
+                            'id': i,
+                            'name': info['name'],
+                            'channels': info['maxInputChannels'],
+                            'sample_rate': int(info['defaultSampleRate'])
+                        })
+                except Exception:
+                    continue
         except Exception as e:
             print(f"Error listing system audio devices: {e}")
+        finally:
+            if p:
+                try:
+                    p.terminate()
+                except Exception:
+                    pass
         return devices
 
     @staticmethod
@@ -136,20 +168,29 @@ class AudioRecorder(QObject):
         devices = []
         if not HAS_PYAUDIO:
             return devices
+        p = None
         try:
             p = pyaudio.PyAudio()
             for i in range(p.get_device_count()):
-                info = p.get_device_info_by_index(i)
-                if info['maxOutputChannels'] > 0:
-                    devices.append({
-                        'id': i,
-                        'name': info['name'],
-                        'channels': info['maxOutputChannels'],
-                        'sample_rate': int(info['defaultSampleRate'])
-                    })
-            p.terminate()
+                try:
+                    info = p.get_device_info_by_index(i)
+                    if info['maxOutputChannels'] > 0:
+                        devices.append({
+                            'id': i,
+                            'name': info['name'],
+                            'channels': info['maxOutputChannels'],
+                            'sample_rate': int(info['defaultSampleRate'])
+                        })
+                except Exception:
+                    continue
         except Exception:
             pass
+        finally:
+            if p:
+                try:
+                    p.terminate()
+                except Exception:
+                    pass
         return devices
 
     def start_recording(self):
@@ -159,6 +200,10 @@ class AudioRecorder(QObject):
         self._running = True
         self._mic_frames = []
         self._system_frames = []
+        self._mic_channels = 1
+        self._mic_rate = self._sample_rate
+        self._sys_channels = 2
+        self._sys_rate = self._sample_rate
 
         self._record_thread = threading.Thread(target=self._record_loop, daemon=True)
         self._record_thread.start()
@@ -170,11 +215,16 @@ class AudioRecorder(QObject):
         try:
             dev_idx = self._mic_device_index
             if dev_idx is None:
-                dev_idx = self._audio.get_default_input_device_info()['index']
+                try:
+                    dev_idx = self._audio.get_default_input_device_info()['index']
+                except Exception:
+                    return None
 
             info = self._audio.get_device_info_by_index(dev_idx)
-            ch = min(2, int(info['maxInputChannels']))
-            sr = min(self._sample_rate, int(info['defaultSampleRate']))
+            ch = int(info['maxInputChannels'])
+            if ch <= 0:
+                return None
+            sr = int(info['defaultSampleRate'])
 
             stream = self._audio.open(
                 format=pyaudio.paInt16,
@@ -184,8 +234,8 @@ class AudioRecorder(QObject):
                 input_device_index=dev_idx,
                 frames_per_buffer=1024
             )
-            stream._actual_channels = ch
-            stream._actual_rate = sr
+            self._mic_channels = ch
+            self._mic_rate = sr
             return stream
         except Exception as e:
             print(f"Failed to open microphone: {e}")
@@ -194,57 +244,34 @@ class AudioRecorder(QObject):
     def _open_system_stream(self):
         if not HAS_PYAUDIO or not self._audio:
             return None
-
-        if self._system_device_index is not None:
-            try:
-                info = self._audio.get_device_info_by_index(self._system_device_index)
-                name = info['name'].lower()
-                if 'loopback' in name or 'wasapi' in name:
-                    return self._open_wasapi_loopback()
-                else:
-                    return self._open_normal_input(self._system_device_index)
-            except Exception as e:
-                print(f"System device open failed: {e}")
-
-        return self._open_wasapi_loopback()
-
-    def _open_wasapi_loopback(self):
-        if not HAS_PYAUDIO or not self._audio:
-            return None
         try:
-            wasapi_idx = self._audio.get_host_api_info_by_type(pyaudio.paWASAPI)['index']
-            output_info = self._audio.get_device_info_by_index(
-                self._audio.get_host_api_info_by_index(wasapi_idx)['defaultOutputDevice']
-            )
+            wasapi_info = self._audio.get_host_api_info_by_type(pyaudio.paWASAPI)
+            output_dev_idx = wasapi_info['defaultOutputDevice']
+            output_info = self._audio.get_device_info_by_index(output_dev_idx)
+
+            ch = min(2, int(output_info['maxOutputChannels']))
+            if ch <= 0:
+                ch = 2
+            sr = int(output_info['defaultSampleRate'])
 
             stream = self._audio.open(
                 format=pyaudio.paInt16,
-                channels=min(2, int(output_info['maxOutputChannels'])),
-                rate=int(output_info['defaultSampleRate']),
+                channels=ch,
+                rate=sr,
                 input=True,
-                input_device_index=output_info['index'],
-                frames_per_buffer=1024,
-                stream_flags=pyaudio.paLoopback
+                input_device_index=output_dev_idx,
+                frames_per_buffer=1024
             )
-            stream._actual_channels = min(2, int(output_info['maxOutputChannels']))
-            stream._actual_rate = int(output_info['defaultSampleRate'])
-            stream._is_loopback = True
+            self._sys_channels = ch
+            self._sys_rate = sr
             return stream
         except Exception as e:
-            print(f"WASAPI loopback unavailable: {e}, trying fallback...")
+            print(f"WASAPI loopback open failed: {e}")
 
-            try:
-                p = self._audio
-                for i in range(p.get_device_count()):
-                    info = p.get_device_info_by_index(i)
-                    name = info['name'].lower()
-                    if ('stereo mix' in name or 'what u hear' in name
-                            or 'wave out mix' in name or '立体声混音' in name):
-                        return self._open_normal_input(i)
-            except Exception as e2:
-                print(f"Fallback also failed: {e2}")
+        if self._system_device_index is not None:
+            return self._open_normal_input(self._system_device_index)
 
-            return None
+        return None
 
     def _open_normal_input(self, device_idx: int):
         if not HAS_PYAUDIO or not self._audio:
@@ -252,7 +279,9 @@ class AudioRecorder(QObject):
         try:
             info = self._audio.get_device_info_by_index(device_idx)
             ch = min(2, int(info['maxInputChannels']))
-            sr = min(self._sample_rate, int(info['defaultSampleRate']))
+            if ch <= 0:
+                return None
+            sr = int(info['defaultSampleRate'])
             stream = self._audio.open(
                 format=pyaudio.paInt16,
                 channels=ch,
@@ -261,94 +290,123 @@ class AudioRecorder(QObject):
                 input_device_index=device_idx,
                 frames_per_buffer=1024
             )
-            stream._actual_channels = ch
-            stream._actual_rate = sr
-            stream._is_loopback = False
+            self._sys_channels = ch
+            self._sys_rate = sr
             return stream
         except Exception as e:
             print(f"Normal input open failed: {e}")
             return None
 
     def _record_loop(self):
-        try:
-            self._mic_stream = None
-            self._system_stream = None
+        mic_stream = None
+        sys_stream = None
 
+        try:
             if self._record_microphone:
-                self._mic_stream = self._open_mic_stream()
-                if self._mic_stream:
-                    self._mic_stream.start_stream()
+                mic_stream = self._open_mic_stream()
 
             if self._record_system_audio:
-                self._system_stream = self._open_system_stream()
-                if self._system_stream:
-                    self._system_stream.start_stream()
+                sys_stream = self._open_system_stream()
 
-            if self._mic_stream is None and self._system_stream is None:
+            if mic_stream is None and sys_stream is None:
                 print("Warning: No audio input available, recording video only.")
                 while self._running:
                     time.sleep(0.1)
-                self._finalize_recording()
                 return
 
             mic_level_window = []
 
             while self._running:
-                try:
-                    if self._mic_stream and self._mic_stream.is_active():
-                        try:
-                            data = self._mic_stream.read(1024, exception_on_overflow=False)
-                            self._mic_frames.append(data)
-                            arr = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
-                            if len(arr) > 0:
-                                rms = float(np.sqrt(np.mean(arr ** 2)))
-                                mic_level_window.append(rms)
-                                if len(mic_level_window) > 10:
-                                    mic_level_window.pop(0)
-                                avg_rms = sum(mic_level_window) / len(mic_level_window)
-                                self.level_changed.emit(min(1.0, avg_rms * 8))
-                        except Exception as e:
-                            pass
+                if mic_stream and mic_stream.is_active():
+                    try:
+                        data = mic_stream.read(1024, exception_on_overflow=False)
+                        self._mic_frames.append(data)
+                        arr = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
+                        if len(arr) > 0:
+                            rms = float(np.sqrt(np.mean(arr ** 2)))
+                            mic_level_window.append(rms)
+                            if len(mic_level_window) > 10:
+                                mic_level_window.pop(0)
+                            avg_rms = sum(mic_level_window) / len(mic_level_window)
+                            self.level_changed.emit(min(1.0, avg_rms * 8))
+                    except Exception:
+                        pass
 
-                    if self._system_stream and self._system_stream.is_active():
-                        try:
-                            data = self._system_stream.read(1024, exception_on_overflow=False)
-                            self._system_frames.append(data)
-                        except Exception as e:
-                            pass
+                if sys_stream and sys_stream.is_active():
+                    try:
+                        data = sys_stream.read(1024, exception_on_overflow=False)
+                        self._system_frames.append(data)
+                    except Exception:
+                        pass
 
-                    time.sleep(0.001)
-                except Exception as e:
-                    print(f"Capture read error: {e}")
-
-            self._finalize_recording()
+                time.sleep(0.001)
 
         except Exception as e:
             print(f"Recording thread error: {e}")
-            self._finalize_recording()
 
-    def _finalize_recording(self):
+        finally:
+            for s in (mic_stream, sys_stream):
+                if s:
+                    try:
+                        s.stop_stream()
+                        s.close()
+                    except Exception:
+                        pass
+
+            self._running = False
+            self._save_to_wav()
+
+    def _frames_to_array(self, frames: List[bytes], actual_ch: int, actual_rate: int, target_rate: int) -> Optional[np.ndarray]:
+        if len(frames) == 0:
+            return None
         try:
-            if self._mic_stream:
-                try:
-                    self._mic_stream.stop_stream()
-                    self._mic_stream.close()
-                except:
-                    pass
-                self._mic_stream = None
+            raw = b''.join(frames)
+            data_int16 = np.frombuffer(raw, dtype=np.int16)
 
-            if self._system_stream:
-                try:
-                    self._system_stream.stop_stream()
-                    self._system_stream.close()
-                except:
-                    pass
-                self._system_stream = None
-        except Exception:
-            pass
+            if actual_ch <= 0:
+                actual_ch = 1
 
-        self._running = False
-        self._save_to_wav()
+            total_samples = len(data_int16)
+            frames_count = total_samples // actual_ch
+            if frames_count <= 0:
+                return None
+
+            data_int16 = data_int16[:frames_count * actual_ch]
+            data_int16 = data_int16.reshape(-1, actual_ch)
+            data_float = data_int16.astype(np.float32) / 32768.0
+
+            if data_float.shape[1] == 1:
+                data_float = np.column_stack([data_float[:, 0], data_float[:, 0]])
+            elif data_float.shape[1] > 2:
+                data_float = data_float[:, :2]
+
+            if actual_rate != target_rate:
+                try:
+                    from scipy.signal import resample_poly
+                    from math import gcd
+                    g = gcd(target_rate, actual_rate)
+                    up = target_rate // g
+                    down = actual_rate // g
+                    new_len = int(len(data_float) * up / down)
+                    if new_len > 0:
+                        data_float = resample_poly(data_float, up, down, axis=0).astype(np.float32)
+                except ImportError:
+                    try:
+                        ratio = target_rate / actual_rate
+                        new_len = int(len(data_float) * ratio)
+                        if new_len > 0 and len(data_float.shape) == 2:
+                            import cv2
+                            data_float = cv2.resize(data_float, (data_float.shape[1], new_len), interpolation=cv2.INTER_LINEAR).astype(np.float32)
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+
+            return data_float
+
+        except Exception as e:
+            print(f"Frame conversion error: {e}")
+            return None
 
     def _save_to_wav(self):
         try:
@@ -358,8 +416,8 @@ class AudioRecorder(QObject):
             target_rate = self._sample_rate
             target_ch = 2
 
-            mic_data = self._frames_to_array(self._mic_frames, target_rate, target_ch)
-            sys_data = self._frames_to_array(self._system_frames, target_rate, target_ch)
+            mic_data = self._frames_to_array(self._mic_frames, self._mic_channels, self._mic_rate, target_rate)
+            sys_data = self._frames_to_array(self._system_frames, self._sys_channels, self._sys_rate, target_rate)
 
             mixed = None
 
@@ -390,51 +448,6 @@ class AudioRecorder(QObject):
 
         except Exception as e:
             print(f"Audio save error: {e}")
-
-    def _frames_to_array(self, frames: List[bytes], target_rate: int, target_ch: int) -> Optional[np.ndarray]:
-        if len(frames) == 0:
-            return None
-        try:
-            raw = b''.join(frames)
-            data_int16 = np.frombuffer(raw, dtype=np.int16)
-
-            actual_ch = 2
-            actual_rate = target_rate
-            if self._mic_stream and frames is self._mic_frames and hasattr(self._mic_stream, '_actual_channels'):
-                actual_ch = self._mic_stream._actual_channels
-                actual_rate = self._mic_stream._actual_rate
-            elif self._system_stream and frames is self._system_frames and hasattr(self._system_stream, '_actual_channels'):
-                actual_ch = self._system_stream._actual_channels
-                actual_rate = self._system_stream._actual_rate
-
-            if actual_ch > 1:
-                data_int16 = data_int16.reshape(-1, actual_ch)
-            else:
-                data_int16 = data_int16.reshape(-1, 1)
-
-            data_float = data_int16.astype(np.float32) / 32768.0
-
-            if data_float.shape[1] == 1 and target_ch == 2:
-                data_float = np.repeat(data_float, 2, axis=1)
-            elif data_float.shape[1] >= 2 and target_ch == 2:
-                data_float = data_float[:, :2]
-
-            if actual_rate != target_rate:
-                try:
-                    import cv2
-                    ratio = target_rate / actual_rate
-                    new_len = int(len(data_float) * ratio)
-                    if new_len > 0 and len(data_float.shape) == 2:
-                        resized = cv2.resize(data_float, (data_float.shape[1], new_len), interpolation=cv2.INTER_LINEAR)
-                        data_float = resized.astype(np.float32)
-                except Exception:
-                    pass
-
-            return data_float
-
-        except Exception as e:
-            print(f"Frame conversion error: {e}")
-            return None
 
     def _write_wav(self, path: str, data: np.ndarray, rate: int, channels: int):
         try:

@@ -609,13 +609,16 @@ class MainWindow(QMainWindow):
             self.show()
             if frame is not None:
                 from PyQt5.QtGui import QImage as _QImage
-                h, w, ch = frame.shape
-                bytes_per_line = ch * w
-                qimg = _QImage(frame.data, w, h, bytes_per_line, _QImage.Format_RGB888).rgbSwapped()
+                h, w = frame.shape[:2]
+                rgb = frame[:, :, ::-1].copy()
+                bytes_per_line = 3 * w
+                qimg = _QImage(rgb.data, w, h, bytes_per_line, _QImage.Format_RGB888).copy()
                 pixmap = QPixmap.fromImage(qimg)
 
                 self._screenshot_editor = ScreenshotEditor(pixmap)
                 self._screenshot_editor.show()
+            else:
+                QMessageBox.warning(self, "提示", "截图失败：无法捕获屏幕画面")
         except Exception as e:
             self.show()
             QMessageBox.critical(self, "错误", f"截图失败: {e}")
