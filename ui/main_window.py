@@ -92,6 +92,8 @@ class MainWindow(QMainWindow):
         self._output_dir = os.path.expanduser("~/Videos")
 
         self._audio_level = 0.0
+        self._mic_status_msg = "未启动"
+        self._sys_status_msg = "未启动"
         self._init_ui()
         self._init_tray()
 
@@ -100,6 +102,8 @@ class MainWindow(QMainWindow):
         self._timer.start(100)
 
         self._audio_recorder.level_changed.connect(self._on_audio_level)
+        self._audio_recorder.mic_ready.connect(self._on_mic_ready)
+        self._audio_recorder.system_ready.connect(self._on_system_ready)
 
     def _init_ui(self):
         central = QWidget()
@@ -216,6 +220,17 @@ class MainWindow(QMainWindow):
         self._refresh_audio_btn.clicked.connect(self._refresh_audio_devices)
         sys_row.addWidget(self._refresh_audio_btn)
         audio_layout.addLayout(sys_row)
+
+        status_row = QHBoxLayout()
+        self._mic_status_label = QLabel("🎙 麦克风: 未启动")
+        self._mic_status_label.setStyleSheet("color: #888; padding: 4px 8px; background: #f5f5f5; border-radius: 4px;")
+        self._sys_status_label = QLabel("🔊 系统声音: 未启动")
+        self._sys_status_label.setStyleSheet("color: #888; padding: 4px 8px; background: #f5f5f5; border-radius: 4px;")
+        status_row.addWidget(self._mic_status_label)
+        status_row.addSpacing(10)
+        status_row.addWidget(self._sys_status_label)
+        status_row.addStretch()
+        audio_layout.addLayout(status_row)
 
         main_layout.addWidget(audio_group)
 
@@ -437,6 +452,40 @@ class MainWindow(QMainWindow):
     def _on_audio_level(self, level: float):
         self._audio_level = level
 
+    def _on_mic_ready(self, ok: bool, msg: str):
+        self._mic_status_msg = msg
+        if ok:
+            self._mic_status_label.setText(f"🎙 麦克风: ✓ 采集中")
+            self._mic_status_label.setStyleSheet(
+                "color: #0a7c0a; padding: 4px 8px; background: #e6f7e6; border-radius: 4px; font-weight: bold;"
+            )
+        else:
+            self._mic_status_label.setText(f"🎙 麦克风: ✗ 失败")
+            self._mic_status_label.setStyleSheet(
+                "color: #a31010; padding: 4px 8px; background: #fde8e8; border-radius: 4px; font-weight: bold;"
+            )
+        self._status_label.setText(msg)
+
+    def _on_system_ready(self, ok: bool, msg: str):
+        self._sys_status_msg = msg
+        if ok:
+            self._sys_status_label.setText(f"🔊 系统声音: ✓ 采集中")
+            self._sys_status_label.setStyleSheet(
+                "color: #0a7c0a; padding: 4px 8px; background: #e6f7e6; border-radius: 4px; font-weight: bold;"
+            )
+        else:
+            self._sys_status_label.setText(f"🔊 系统声音: ✗ 失败")
+            self._sys_status_label.setStyleSheet(
+                "color: #a31010; padding: 4px 8px; background: #fde8e8; border-radius: 4px; font-weight: bold;"
+            )
+        self._status_label.setText(msg)
+
+    def _reset_audio_status_labels(self):
+        self._mic_status_label.setText("🎙 麦克风: 未启动")
+        self._mic_status_label.setStyleSheet("color: #888; padding: 4px 8px; background: #f5f5f5; border-radius: 4px;")
+        self._sys_status_label.setText("🔊 系统声音: 未启动")
+        self._sys_status_label.setStyleSheet("color: #888; padding: 4px 8px; background: #f5f5f5; border-radius: 4px;")
+
     def _refresh_audio_devices(self):
         self._mic_combo.clear()
         self._mic_combo.addItem("默认麦克风", -1)
@@ -503,6 +552,7 @@ class MainWindow(QMainWindow):
         if sys_id != -1:
             self._audio_recorder.set_system_audio_device(sys_id)
 
+        self._reset_audio_status_labels()
         self._audio_recorder.start_recording()
 
         self._capture_thread = CaptureThread(self._screen_capture, self._annotation_engine, self._video_encoder)
@@ -555,11 +605,43 @@ class MainWindow(QMainWindow):
 
         if final_path and os.path.exists(final_path):
             self._status_label.setText(f"已保存: {os.path.basename(final_path)}")
-            reply = QMessageBox.question(self, "录制完成",
-                                       f"视频已保存到:\n{final_path}\n\n是否进入剪辑界面?",
-                                       QMessageBox.Yes | QMessageBox.No)
-            if reply == QMessageBox.Yes:
-                self._open_video_editor(final_path)
+
+            mic_ok, mic_err = self._audio_recorder.get_mic_status()
+            sys_ok, sys_err = self._audio_recorder.get_system_status()
+            need_mic = self._cb_microphone.isChecked()
+            need_sys = self._cb_system_audio.isChecked()
+            has_mic_data = self._audio_recorder.has_mic_samples()
+            has_sys_data = self._audio_recorder.has_system_samples()
+
+            audio_warnings = []
+            if need_mic and not mic_ok:
+                audio_warnings.append(f"⚠ 麦克风采集失败: {mic_err}")
+            elif need_mic and not has_mic_data:
+                audio_warnings.append("⚠ 麦克风已启用但未采集到任何声音数据")
+
+            if need_sys and not sys_ok:
+                audio_warnings.append(f"⚠ 系统声音采集失败: {sys_err}\n  建议: 安装soundcard库后重启，或在系统声音下拉中选择其他设备")
+            elif need_sys and not has_sys_data:
+                audio_warnings.append("⚠ 系统声音已启用但未采集到任何声音数据\n  请确认播放设备有声音输出，或换用下拉中的其他系统声音设备")
+
+            base_msg = f"视频已保存到:\n{final_path}\n"
+            if audio_warnings:
+                warn_text = "\n\n".join(audio_warnings)
+                base_msg += f"\n\n音频采集状态:\n{warn_text}\n\n(可能生成无声或缺少部分声道的视频)"
+                QMessageBox.warning(self, "录制完成 (有警告)", base_msg)
+            else:
+                status_parts = []
+                if need_mic and has_mic_data:
+                    status_parts.append("✓ 麦克风")
+                if need_sys and has_sys_data:
+                    status_parts.append("✓ 系统声音")
+                if status_parts:
+                    base_msg += f"\n\n音频: {' + '.join(status_parts)} 已录制"
+                reply = QMessageBox.question(self, "录制完成",
+                                           base_msg + "\n\n是否进入剪辑界面?",
+                                           QMessageBox.Yes | QMessageBox.No)
+                if reply == QMessageBox.Yes:
+                    self._open_video_editor(final_path)
         else:
             self._status_label.setText("录制已取消")
 
