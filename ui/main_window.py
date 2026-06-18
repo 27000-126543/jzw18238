@@ -202,6 +202,21 @@ class MainWindow(QMainWindow):
         mic_row.addWidget(self._mic_combo, 1)
         audio_layout.addLayout(mic_row)
 
+        sys_row = QHBoxLayout()
+        self._sys_combo = QComboBox()
+        sys_devs = AudioRecorder.get_system_audio_devices()
+        if len(sys_devs) == 0:
+            self._sys_combo.addItem("(未检测到系统声音采集设备，可尝试安装虚拟音频设备)", -1)
+        else:
+            for dev in sys_devs:
+                self._sys_combo.addItem(dev['name'], dev.get('id', -1))
+        sys_row.addWidget(QLabel("系统声音:"))
+        sys_row.addWidget(self._sys_combo, 1)
+        self._refresh_audio_btn = QPushButton("刷新")
+        self._refresh_audio_btn.clicked.connect(self._refresh_audio_devices)
+        sys_row.addWidget(self._refresh_audio_btn)
+        audio_layout.addLayout(sys_row)
+
         main_layout.addWidget(audio_group)
 
         quality_group = QGroupBox("画质设置")
@@ -422,6 +437,21 @@ class MainWindow(QMainWindow):
     def _on_audio_level(self, level: float):
         self._audio_level = level
 
+    def _refresh_audio_devices(self):
+        self._mic_combo.clear()
+        self._mic_combo.addItem("默认麦克风", -1)
+        for dev in AudioRecorder.get_input_devices():
+            self._mic_combo.addItem(f"{dev['name']} (输入)", dev['id'])
+
+        self._sys_combo.clear()
+        sys_devs = AudioRecorder.get_system_audio_devices()
+        if len(sys_devs) == 0:
+            self._sys_combo.addItem("(未检测到系统声音采集设备)", -1)
+        else:
+            for dev in sys_devs:
+                self._sys_combo.addItem(dev['name'], dev.get('id', -1))
+        self._status_label.setText("音频设备列表已刷新")
+
     def _toggle_recording(self):
         if self._is_recording:
             self._stop_recording()
@@ -469,6 +499,9 @@ class MainWindow(QMainWindow):
         mic_id = self._mic_combo.currentData()
         if mic_id != -1:
             self._audio_recorder.set_microphone_device(mic_id)
+        sys_id = self._sys_combo.currentData()
+        if sys_id != -1:
+            self._audio_recorder.set_system_audio_device(sys_id)
 
         self._audio_recorder.start_recording()
 

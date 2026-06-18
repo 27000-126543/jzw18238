@@ -102,7 +102,6 @@ class ScreenCapture(QObject):
             raw = self.sct.grab(region)
             frame = np.array(raw)
             frame = frame[:, :, :3]
-            frame = frame[:, :, ::-1].copy()
             return frame
         except Exception as e:
             print(f"Capture error: {e}")
