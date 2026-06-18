@@ -1,12 +1,25 @@
 from PyQt5.QtWidgets import (QWidget, QPushButton, QLabel, QSlider, QVBoxLayout, QHBoxLayout,
-                             QFileDialog, QProgressBar, QDoubleSpinBox, QMessageBox, QStyle)
-from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QSize
+                             QFileDialog, QProgressBar, QDoubleSpinBox, QMessageBox, QStyle,
+                             QGroupBox, QCheckBox, QApplication)
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QSize, QThread
 from PyQt5.QtGui import QPixmap, QImage, QPainter, QColor, QPen, QFont
 import cv2
 import os
+import subprocess
+import tempfile
+import numpy as np
+import threading
 from core.video_encoder import VideoEditor
 from core.gif_exporter import GIFExporter
-import numpy as np
+
+try:
+    import soundcard as sc
+    import soundfile as sf
+    HAS_SOUNDCARD = True
+except ImportError:
+    HAS_SOUNDCARD = False
+    sc = None
+    sf = None
 
 
 class VideoEditorWindow(QWidget):
@@ -23,6 +36,10 @@ class VideoEditorWindow(QWidget):
         self._end_time = self._duration
         self._is_playing = False
         self._frame_cache = {}
+        self._is_audio_playing = False
+        self._audio_speaker = None
+        self._audio_data = None
+        self._audio_sr = 48000
         
         self._gif_exporter.export_progress.connect(self._on_gif_progress)
         self._gif_exporter.export_finished.connect(self._on_gif_finished)
@@ -126,7 +143,62 @@ class VideoEditorWindow(QWidget):
         control_layout.addWidget(self._progress_bar)
         
         main_layout.addWidget(control_widget)
-        
+
+        audio_group = QGroupBox("🔊 音频设置")
+        audio_group.setStyleSheet("""
+            QGroupBox {
+                font-weight: bold;
+                font-size: 13px;
+                border: 1px solid #ddd;
+                border-radius: 8px;
+                margin-top: 8px;
+                padding-top: 10px;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 12px;
+                padding: 0 6px;
+            }
+            QLabel { font-size: 12px; }
+            QSlider::handle:horizontal {
+                background: #0078d4;
+                width: 14px;
+                margin: -5px 0;
+                border-radius: 7px;
+            }
+        """)
+        audio_layout = QHBoxLayout(audio_group)
+        audio_layout.setContentsMargins(14, 10, 14, 12)
+
+        audio_layout.addWidget(QLabel("音量:"))
+        self._volume_slider = QSlider(Qt.Horizontal)
+        self._volume_slider.setRange(0, 200)
+        self._volume_slider.setValue(100)
+        self._volume_slider.setFixedWidth(200)
+        self._volume_slider.valueChanged.connect(self._on_volume_changed)
+        audio_layout.addWidget(self._volume_slider)
+
+        self._volume_label = QLabel("100%")
+        self._volume_label.setStyleSheet("color: #0078d4; font-weight: bold; min-width: 45px;")
+        audio_layout.addWidget(self._volume_label)
+
+        self._btn_preview_audio = QPushButton("▶ 试听 5 秒")
+        self._btn_preview_audio.setStyleSheet("""
+            QPushButton {
+                padding: 6px 14px;
+                background: #f0f0f0;
+                border: 1px solid #ccc;
+                border-radius: 4px;
+            }
+            QPushButton:hover { background: #e0e0e0; }
+            QPushButton:disabled { color: #aaa; }
+        """)
+        self._btn_preview_audio.clicked.connect(self._preview_audio_5s)
+        audio_layout.addWidget(self._btn_preview_audio)
+
+        audio_layout.addStretch()
+        main_layout.addWidget(audio_group)
+
         export_widget = QWidget()
         export_layout = QHBoxLayout(export_widget)
         export_layout.setContentsMargins(0, 0, 0, 0)
@@ -306,16 +378,44 @@ class VideoEditorWindow(QWidget):
         if not output_path:
             return
         
+        volume = self._volume_slider.value() / 100.0
+
         self._set_buttons_enabled(False)
         self._progress_bar.setVisible(True)
         self._progress_bar.setRange(0, 0)
         
         import threading
         def do_export():
-            result = self._editor.trim_video(self._video_path, output_path, self._start_time, self._end_time)
-            QTimer.singleShot(0, lambda: self._on_export_done(result, output_path))
+            success = False
+            if abs(volume - 1.0) < 0.01:
+                success = self._editor.trim_video(self._video_path, output_path, self._start_time, self._end_time)
+            else:
+                success = self._export_with_volume(output_path, volume)
+            QTimer.singleShot(0, lambda: self._on_export_done(success, output_path))
         
         threading.Thread(target=do_export, daemon=True).start()
+
+    def _export_with_volume(self, output_path: str, volume: float) -> bool:
+        try:
+            ffmpeg = self._get_ffmpeg_path()
+            duration = self._end_time - self._start_time
+
+            cmd = [
+                ffmpeg, "-y",
+                "-ss", str(self._start_time),
+                "-i", self._video_path,
+                "-t", str(duration),
+                "-c:v", "copy",
+                "-af", f"volume={volume}",
+                "-c:a", "aac",
+                "-b:a", "192k",
+                output_path
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+            return result.returncode == 0 and os.path.exists(output_path)
+        except Exception as e:
+            print(f"Export with volume error: {e}")
+            return False
     
     def _on_export_done(self, success: bool, path: str):
         self._progress_bar.setVisible(False)
@@ -361,11 +461,124 @@ class VideoEditorWindow(QWidget):
         self._progress_bar.setVisible(False)
         self._set_buttons_enabled(True)
         QMessageBox.critical(self, "错误", f"导出失败: {error}")
-    
+
+    def _on_volume_changed(self, value: int):
+        self._volume_label.setText(f"{value}%")
+
+    def _get_ffmpeg_path(self) -> str:
+        try:
+            import imageio_ffmpeg
+            return imageio_ffmpeg.get_ffmpeg_exe()
+        except Exception:
+            return "ffmpeg"
+
+    def _extract_audio_segment(self, start_time: float, duration: float) -> Optional[str]:
+        try:
+            ffmpeg = self._get_ffmpeg_path()
+            tmp_wav = tempfile.mktemp(suffix=".wav", prefix="prev_audio_")
+
+            cmd = [
+                ffmpeg, "-y",
+                "-ss", str(start_time),
+                "-i", self._video_path,
+                "-t", str(duration),
+                "-vn",
+                "-acodec", "pcm_s16le",
+                "-ar", "48000",
+                "-ac", "2",
+                tmp_wav
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            if result.returncode == 0 and os.path.exists(tmp_wav):
+                return tmp_wav
+        except Exception as e:
+            print(f"Extract audio error: {e}")
+        return None
+
+    def _preview_audio_5s(self):
+        if not HAS_SOUNDCARD:
+            QMessageBox.information(self, "提示", "未安装 soundcard 库，无法试听音频\n请先 pip install soundcard")
+            return
+
+        if self._is_audio_playing:
+            self._stop_audio_playback()
+            return
+
+        preview_start = self._current_time
+        preview_dur = min(5.0, self._end_time - preview_start)
+        if preview_dur < 0.1:
+            preview_start = self._start_time
+            preview_dur = min(5.0, self._end_time - self._start_time)
+
+        self._btn_preview_audio.setText("⏹ 停止试听")
+        self._btn_preview_audio.setEnabled(False)
+        QApplication.processEvents() if hasattr(QApplication, 'processEvents') else None
+
+        def play_task():
+            tmp_wav = self._extract_audio_segment(preview_start, preview_dur)
+            if not tmp_wav:
+                QTimer.singleShot(0, lambda: self._on_audio_preview_failed())
+                return
+
+            try:
+                data, sr = sf.read(tmp_wav)
+                volume = self._volume_slider.value() / 100.0
+                if volume != 1.0:
+                    data = data * volume
+                    data = np.clip(data, -0.99, 0.99)
+
+                try:
+                    os.remove(tmp_wav)
+                except Exception:
+                    pass
+
+                speaker = sc.default_speaker()
+                self._audio_speaker = speaker
+                self._audio_data = data
+                self._audio_sr = sr
+
+                def playback_finished():
+                    QTimer.singleShot(0, lambda: self._on_audio_preview_finished())
+
+                speaker.play(data, samplerate=sr, blocksize=512, finished_callback=playback_finished)
+                QTimer.singleShot(0, lambda: self._btn_preview_audio.setEnabled(True))
+            except Exception as e:
+                print(f"Playback error: {e}")
+                QTimer.singleShot(0, lambda: self._on_audio_preview_failed())
+                try:
+                    os.remove(tmp_wav)
+                except Exception:
+                    pass
+
+        self._is_audio_playing = True
+        threading.Thread(target=play_task, daemon=True).start()
+
+    def _stop_audio_playback(self):
+        try:
+            if self._audio_speaker:
+                self._audio_speaker.stop()
+        except Exception:
+            pass
+        self._is_audio_playing = False
+        self._btn_preview_audio.setText("▶ 试听 5 秒")
+
+    def _on_audio_preview_finished(self):
+        self._is_audio_playing = False
+        self._btn_preview_audio.setText("▶ 试听 5 秒")
+        self._btn_preview_audio.setEnabled(True)
+
+    def _on_audio_preview_failed(self):
+        self._is_audio_playing = False
+        self._btn_preview_audio.setText("▶ 试听 5 秒")
+        self._btn_preview_audio.setEnabled(True)
+        QMessageBox.warning(self, "提示", "音频试听失败，视频可能没有音轨")
+
     def _set_buttons_enabled(self, enabled: bool):
         self._btn_export_mp4.setEnabled(enabled)
         self._btn_export_gif.setEnabled(enabled)
-    
+        self._btn_preview_audio.setEnabled(enabled and HAS_SOUNDCARD)
+
     def closeEvent(self, event):
         self._stop_play()
+        self._stop_audio_playback()
         super().closeEvent(event)

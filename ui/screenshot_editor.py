@@ -1,6 +1,6 @@
-from PyQt5.QtWidgets import (QWidget, QLabel, QVBoxLayout, QHBoxLayout, QSpinBox, QColorDialog, QToolBar, QAction, QFileDialog, QMessageBox, QInputDialog, QSizePolicy)
+from PyQt5.QtWidgets import (QWidget, QLabel, QVBoxLayout, QHBoxLayout, QSpinBox, QColorDialog, QToolBar, QAction, QFileDialog, QMessageBox, QInputDialog, QSizePolicy, QMenu, QPushButton, QToolButton)
 from PyQt5.QtCore import Qt, QPoint, QRect, QSize, pyqtSignal, QEvent
-from PyQt5.QtGui import QPainter, QPen, QColor, QBrush, QPixmap, QImage, QPainterPath, QFont, QGuiApplication
+from PyQt5.QtGui import QPainter, QPen, QColor, QBrush, QPixmap, QImage, QPainterPath, QFont, QGuiApplication, QFontMetrics
 from typing import Optional, Tuple, List
 from enum import Enum
 import math
@@ -31,6 +31,7 @@ class ScreenshotAnnotation:
 
 class ScreenshotEditor(QWidget):
     closed = pyqtSignal()
+    file_saved = pyqtSignal(str)
 
     def __init__(self, screenshot: QPixmap):
         super().__init__()
@@ -122,10 +123,25 @@ class ScreenshotEditor(QWidget):
 
         toolbar.addSeparator()
 
-        copy_action = QAction("📋 复制到剪贴板", self)
-        copy_action.setShortcut("Ctrl+C")
-        copy_action.triggered.connect(self._copy_to_clipboard)
-        toolbar.addAction(copy_action)
+        copy_menu = QMenu()
+        copy_full_action = QAction("📋 复制整张截图", self)
+        copy_full_action.setShortcut("Ctrl+C")
+        copy_full_action.triggered.connect(lambda: self._copy_to_clipboard(mode="full"))
+        copy_menu.addAction(copy_full_action)
+
+        copy_roi_action = QAction("✂ 仅复制标注区域", self)
+        copy_roi_action.setShortcut("Ctrl+Shift+C")
+        copy_roi_action.triggered.connect(lambda: self._copy_to_clipboard(mode="region"))
+        copy_menu.addAction(copy_roi_action)
+
+        copy_btn = QToolButton()
+        copy_btn.setText("📋 复制")
+        copy_btn.setMenu(copy_menu)
+        copy_btn.setPopupMode(QToolButton.MenuButtonPopup)
+        copy_btn.clicked.connect(lambda: self._copy_to_clipboard(mode="full"))
+        copy_btn.setToolButtonStyle(Qt.ToolButtonTextOnly)
+        copy_btn.setStyleSheet("QToolButton { padding: 4px 10px; }")
+        toolbar.addWidget(copy_btn)
 
         save_action = QAction("💾 保存", self)
         save_action.setShortcut("Ctrl+S")
@@ -457,18 +473,77 @@ class ScreenshotEditor(QWidget):
         painter.drawPath(path)
         painter.setBrush(Qt.NoBrush)
 
-    def _copy_to_clipboard(self):
+    def _get_annotation_bounds(self, padding: int = 20) -> Optional[QRect]:
+        if len(self._annotations) == 0:
+            return None
+
+        min_x = float('inf')
+        min_y = float('inf')
+        max_x = float('-inf')
+        max_y = float('-inf')
+
+        for ann in self._annotations:
+            if ann.tool == ScreenshotTool.LINE and len(ann.points) > 0:
+                for p in ann.points:
+                    min_x = min(min_x, p.x())
+                    min_y = min(min_y, p.y())
+                    max_x = max(max_x, p.x())
+                    max_y = max(max_y, p.y())
+            elif ann.start and ann.end:
+                rect = QRect(ann.start, ann.end).normalized()
+                min_x = min(min_x, rect.left())
+                min_y = min(min_y, rect.top())
+                max_x = max(max_x, rect.right())
+                max_y = max(max_y, rect.bottom())
+            elif ann.start and ann.text:
+                fm = QFontMetrics(QFont())
+                text_rect = fm.boundingRect(ann.text)
+                min_x = min(min_x, ann.start.x())
+                min_y = min(min_y, ann.start.y() - text_rect.height())
+                max_x = max(max_x, ann.start.x() + text_rect.width())
+                max_y = max(max_y, ann.start.y())
+
+        if min_x == float('inf'):
+            return None
+
+        img_w = self._original_image.width()
+        img_h = self._original_image.height()
+        min_x = max(0, min_x - padding)
+        min_y = max(0, min_y - padding)
+        max_x = min(img_w - 1, max_x + padding)
+        max_y = min(img_h - 1, max_y + padding)
+
+        return QRect(min_x, min_y, max_x - min_x + 1, max_y - min_y + 1)
+
+    def _copy_to_clipboard(self, mode: str = "full"):
         try:
             rendered = self._render_image(include_current=False)
             if rendered is None or rendered.isNull():
                 QMessageBox.warning(self, "失败", f"无法生成图像: {self._error_msg}")
                 return
 
+            final_img = rendered
+            info_text = ""
+
+            if mode == "region":
+                bounds = self._get_annotation_bounds(padding=25)
+                if bounds is None or bounds.width() < 10 or bounds.height() < 10:
+                    QMessageBox.information(self, "提示", "还没有任何标注，无法复制标注区域\n请先画点东西再使用此功能")
+                    return
+                final_img = rendered.copy(bounds)
+                info_text = f" ({bounds.width()}×{bounds.height()})"
+
+            if final_img.isNull():
+                QMessageBox.warning(self, "失败", "裁剪后的图像为空")
+                return
+
             clipboard = QGuiApplication.clipboard()
-            clipboard.setImage(rendered)
+            clipboard.setImage(final_img)
             count = len(self._annotations)
-            self._tool_label.setText(f"✅ 已复制！共 {count} 个标注")
-            QMessageBox.information(self, "成功", f"已复制到剪贴板!\n共 {count} 个标注。")
+            mode_text = "整张截图" if mode == "full" else "标注区域"
+            self._tool_label.setText(f"✅ 已复制{mode_text}！共 {count} 个标注{info_text}")
+            QMessageBox.information(self, "成功",
+                                    f"已复制{mode_text}到剪贴板！\n共 {count} 个标注{info_text}")
         except Exception as e:
             QMessageBox.critical(self, "失败", f"复制出错: {str(e)}")
 
@@ -484,6 +559,7 @@ class ScreenshotEditor(QWidget):
             if path:
                 if rendered.save(path):
                     QMessageBox.information(self, "成功", f"已保存到:\n{path}")
+                    self.file_saved.emit(path)
                 else:
                     QMessageBox.critical(self, "失败", "保存失败")
         except Exception as e:

@@ -1,4 +1,4 @@
-from PyQt5.QtWidgets import (QMainWindow, QWidget, QPushButton, QLabel, QComboBox, QSpinBox, QCheckBox, QVBoxLayout, QHBoxLayout, QGroupBox, QFileDialog, QMessageBox, QSystemTrayIcon, QMenu, QAction, QStyle, QSizePolicy, QProgressBar, QApplication, QFrame)
+from PyQt5.QtWidgets import (QMainWindow, QWidget, QPushButton, QLabel, QComboBox, QSpinBox, QCheckBox, QVBoxLayout, QHBoxLayout, QGroupBox, QFileDialog, QMessageBox, QSystemTrayIcon, QMenu, QAction, QStyle, QSizePolicy, QProgressBar, QApplication, QFrame, QDialog, QListWidget, QListWidgetItem, QAbstractItemView)
 from PyQt5.QtCore import Qt, QTimer, QPoint, QRect, pyqtSignal, QSize, QThread
 from PyQt5.QtGui import QIcon, QPixmap, QImage, QPainter, QColor, QFont, QGuiApplication
 import sys
@@ -13,11 +13,13 @@ from core.audio_recorder import AudioRecorder
 from core.video_encoder import VideoEncoder
 from core.annotation_engine import AnnotationEngine
 from core.gif_exporter import GIFExporter
+from core.history_manager import HistoryManager
 
+from ui.screenshot_editor import ScreenshotEditor
 from ui.annotation_overlay import AnnotationOverlay
 from ui.region_selector import RegionSelector
-from ui.video_editor import VideoEditorWindow
-from ui.screenshot_editor import ScreenshotEditor
+from ui.video_editor import VideoEditor
+from ui.audio_check_dialog import AudioCheckDialog
 
 
 class CaptureThread(QThread):
@@ -74,6 +76,7 @@ class MainWindow(QMainWindow):
         self._video_encoder = VideoEncoder()
         self._annotation_engine = AnnotationEngine()
         self._gif_exporter = GIFExporter()
+        self._history_manager = HistoryManager()
 
         self._capture_thread: Optional[CaptureThread] = None
         self._is_recording = False
@@ -104,6 +107,9 @@ class MainWindow(QMainWindow):
         self._audio_recorder.level_changed.connect(self._on_audio_level)
         self._audio_recorder.mic_ready.connect(self._on_mic_ready)
         self._audio_recorder.system_ready.connect(self._on_system_ready)
+
+        self._history_manager.history_updated.connect(self._populate_history_list)
+        self._populate_history_list()
 
     def _init_ui(self):
         central = QWidget()
@@ -316,6 +322,51 @@ class MainWindow(QMainWindow):
         output_row.addWidget(self._output_label, 1)
         output_row.addWidget(self._browse_btn)
         main_layout.addLayout(output_row)
+
+        history_group = QGroupBox("📁 最近录制")
+        history_group.setStyleSheet(self._group_style())
+        history_layout = QVBoxLayout(history_group)
+        history_layout.setSpacing(8)
+
+        self._history_list = QListWidget()
+        self._history_list.setStyleSheet("""
+            QListWidget {
+                border: 1px solid #ddd;
+                border-radius: 4px;
+                background: white;
+                padding: 4px;
+            }
+            QListWidget::item {
+                padding: 8px;
+                border-bottom: 1px solid #f0f0f0;
+            }
+            QListWidget::item:hover {
+                background: #f5faff;
+            }
+            QListWidget::item:selected {
+                background: #e6f2ff;
+                color: #0078d4;
+            }
+        """)
+        self._history_list.setSelectionMode(QAbstractItemView.SingleSelection)
+        self._history_list.itemDoubleClicked.connect(self._on_history_double_clicked)
+        self._history_list.setMinimumHeight(140)
+        history_layout.addWidget(self._history_list)
+
+        history_btn_row = QHBoxLayout()
+        self._history_preview_btn = QPushButton("▶ 打开文件")
+        self._history_preview_btn.clicked.connect(self._on_history_open_file)
+        self._history_folder_btn = QPushButton("📂 打开文件夹")
+        self._history_folder_btn.clicked.connect(self._on_history_open_folder)
+        self._history_edit_btn = QPushButton("✂ 进入剪辑")
+        self._history_edit_btn.clicked.connect(self._on_history_reedit)
+        history_btn_row.addWidget(self._history_preview_btn)
+        history_btn_row.addWidget(self._history_folder_btn)
+        history_btn_row.addWidget(self._history_edit_btn)
+        history_btn_row.addStretch()
+        history_layout.addLayout(history_btn_row)
+
+        main_layout.addWidget(history_group)
 
         main_layout.addStretch()
 
@@ -606,42 +657,39 @@ class MainWindow(QMainWindow):
         if final_path and os.path.exists(final_path):
             self._status_label.setText(f"已保存: {os.path.basename(final_path)}")
 
-            mic_ok, mic_err = self._audio_recorder.get_mic_status()
-            sys_ok, sys_err = self._audio_recorder.get_system_status()
+            mic_data, mic_sr = self._audio_recorder.get_mic_audio()
+            sys_data, sys_sr = self._audio_recorder.get_system_audio()
+
             need_mic = self._cb_microphone.isChecked()
             need_sys = self._cb_system_audio.isChecked()
-            has_mic_data = self._audio_recorder.has_mic_samples()
-            has_sys_data = self._audio_recorder.has_system_samples()
 
-            audio_warnings = []
-            if need_mic and not mic_ok:
-                audio_warnings.append(f"⚠ 麦克风采集失败: {mic_err}")
-            elif need_mic and not has_mic_data:
-                audio_warnings.append("⚠ 麦克风已启用但未采集到任何声音数据")
+            show_audio_check = need_mic or need_sys
+            if show_audio_check:
+                dlg = AudioCheckDialog(mic_data, mic_sr, sys_data, sys_sr, self)
+                dlg.rerecord_requested.connect(self._on_rerecord_requested)
+                result = dlg.exec_()
+                if result != QDialog.Accepted:
+                    return
 
-            if need_sys and not sys_ok:
-                audio_warnings.append(f"⚠ 系统声音采集失败: {sys_err}\n  建议: 安装soundcard库后重启，或在系统声音下拉中选择其他设备")
-            elif need_sys and not has_sys_data:
-                audio_warnings.append("⚠ 系统声音已启用但未采集到任何声音数据\n  请确认播放设备有声音输出，或换用下拉中的其他系统声音设备")
+            try:
+                file_size = os.path.getsize(final_path)
+            except Exception:
+                file_size = 0
 
-            base_msg = f"视频已保存到:\n{final_path}\n"
-            if audio_warnings:
-                warn_text = "\n\n".join(audio_warnings)
-                base_msg += f"\n\n音频采集状态:\n{warn_text}\n\n(可能生成无声或缺少部分声道的视频)"
-                QMessageBox.warning(self, "录制完成 (有警告)", base_msg)
-            else:
-                status_parts = []
-                if need_mic and has_mic_data:
-                    status_parts.append("✓ 麦克风")
-                if need_sys and has_sys_data:
-                    status_parts.append("✓ 系统声音")
-                if status_parts:
-                    base_msg += f"\n\n音频: {' + '.join(status_parts)} 已录制"
-                reply = QMessageBox.question(self, "录制完成",
-                                           base_msg + "\n\n是否进入剪辑界面?",
-                                           QMessageBox.Yes | QMessageBox.No)
-                if reply == QMessageBox.Yes:
-                    self._open_video_editor(final_path)
+            w, h = self._screen_capture.get_current_resolution()
+            self._history_manager.add_item(
+                item_type="video",
+                path=final_path,
+                duration=self._record_duration(),
+                resolution=f"{w}×{h}",
+                size_bytes=file_size,
+            )
+
+            reply = QMessageBox.question(self, "录制完成",
+                                       f"视频已保存到:\n{final_path}\n\n是否进入剪辑界面?",
+                                       QMessageBox.Yes | QMessageBox.No)
+            if reply == QMessageBox.Yes:
+                self._open_video_editor(final_path)
         else:
             self._status_label.setText("录制已取消")
 
@@ -698,6 +746,7 @@ class MainWindow(QMainWindow):
                 pixmap = QPixmap.fromImage(qimg)
 
                 self._screenshot_editor = ScreenshotEditor(pixmap)
+                self._screenshot_editor.file_saved.connect(self._on_screenshot_saved)
                 self._screenshot_editor.show()
             else:
                 QMessageBox.warning(self, "提示", "截图失败：无法捕获屏幕画面")
@@ -707,7 +756,152 @@ class MainWindow(QMainWindow):
 
     def _open_video_editor(self, video_path: str):
         self._video_editor = VideoEditorWindow(video_path)
+        self._video_editor.export_requested.connect(self._on_editor_exported)
         self._video_editor.show()
+
+    def _on_editor_exported(self, path: str):
+        if not path or not os.path.exists(path):
+            return
+        ext = os.path.splitext(path)[1].lower()
+        item_type = "video"
+        if ext == ".gif":
+            item_type = "gif"
+
+        try:
+            file_size = os.path.getsize(path)
+        except Exception:
+            file_size = 0
+
+        self._history_manager.add_item(
+            item_type=item_type,
+            path=path,
+            size_bytes=file_size,
+        )
+
+    def _on_screenshot_saved(self, path: str):
+        if not path or not os.path.exists(path):
+            return
+        try:
+            file_size = os.path.getsize(path)
+        except Exception:
+            file_size = 0
+        self._history_manager.add_item(
+            item_type="screenshot",
+            path=path,
+            size_bytes=file_size,
+        )
+
+    def _record_duration(self) -> float:
+        if self._record_start_time == 0:
+            return 0.0
+        end_time = time.time()
+        return max(0.0, end_time - self._record_start_time - self._paused_duration)
+
+    def _on_rerecord_requested(self):
+        pass
+
+    def _populate_history_list(self):
+        self._history_list.clear()
+        items = self._history_manager.get_items()
+        if len(items) == 0:
+            item = QListWidgetItem("  (暂无录制记录)")
+            item.setFlags(Qt.NoItemFlags)
+            self._history_list.addItem(item)
+            return
+
+        for it in items:
+            icon_map = {
+                "video": "🎬",
+                "gif": "🎞",
+                "screenshot": "🖼",
+            }
+            icon = icon_map.get(it["type"], "📄")
+            name = it.get("title", os.path.basename(it["path"]))
+            ts = HistoryManager.format_timestamp(it.get("timestamp", 0))
+            size_str = HistoryManager.format_size(it.get("size_bytes", 0))
+
+            line1 = f"{icon}  {name}"
+            line2 = f"      {ts}  |  {size_str}"
+            if it.get("duration", 0) > 0:
+                dur = it["duration"]
+                mins = int(dur // 60)
+                secs = int(dur % 60)
+                line2 += f"  |  {mins}:{secs:02d}"
+            if it.get("resolution"):
+                line2 += f"  |  {it['resolution']}"
+
+            item = QListWidgetItem(line1 + "\n" + line2)
+            item.setData(Qt.UserRole, it)
+            self._history_list.addItem(item)
+
+    def _get_selected_history_item(self) -> Optional[dict]:
+        current = self._history_list.currentItem()
+        if current is None:
+            return None
+        data = current.data(Qt.UserRole)
+        if data is None:
+            return None
+        return data
+
+    def _on_history_double_clicked(self, item):
+        data = item.data(Qt.UserRole)
+        if not data:
+            return
+        self._open_history_file(data)
+
+    def _on_history_open_file(self):
+        data = self._get_selected_history_item()
+        if not data:
+            QMessageBox.information(self, "提示", "请先选择一个历史记录")
+            return
+        self._open_history_file(data)
+
+    def _on_history_open_folder(self):
+        data = self._get_selected_history_item()
+        if not data:
+            QMessageBox.information(self, "提示", "请先选择一个历史记录")
+            return
+        path = data.get("path", "")
+        if not path or not os.path.exists(path):
+            QMessageBox.warning(self, "提示", "文件不存在")
+            return
+        folder = os.path.dirname(path)
+        try:
+            if os.name == "nt":
+                os.startfile(folder)
+            else:
+                import subprocess
+                subprocess.Popen(["xdg-open", folder])
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"无法打开文件夹: {e}")
+
+    def _on_history_reedit(self):
+        data = self._get_selected_history_item()
+        if not data:
+            QMessageBox.information(self, "提示", "请先选择一个视频历史记录")
+            return
+        if data.get("type") != "video":
+            QMessageBox.information(self, "提示", "只有视频可以进入剪辑")
+            return
+        path = data.get("path", "")
+        if not path or not os.path.exists(path):
+            QMessageBox.warning(self, "提示", "文件不存在")
+            return
+        self._open_video_editor(path)
+
+    def _open_history_file(self, data: dict):
+        path = data.get("path", "")
+        if not path or not os.path.exists(path):
+            QMessageBox.warning(self, "提示", "文件不存在")
+            return
+        try:
+            if os.name == "nt":
+                os.startfile(path)
+            else:
+                import subprocess
+                subprocess.Popen(["xdg-open", path])
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"无法打开文件: {e}")
 
     def _update_ui(self):
         if self._is_recording and not self._is_paused:

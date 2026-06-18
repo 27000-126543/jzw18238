@@ -444,3 +444,51 @@ class AudioRecorder(QObject):
 
     def has_system_samples(self) -> bool:
         return len(self._sys_data) > 0 and sum(len(c) for c in self._sys_data) > 100
+
+    def get_mic_audio(self) -> Tuple[Optional[np.ndarray], int]:
+        if len(self._mic_data) == 0:
+            return None, 0
+        with self._lock:
+            data = np.concatenate(self._mic_data, axis=0)
+        return data.copy(), self._mic_samplerate
+
+    def get_system_audio(self) -> Tuple[Optional[np.ndarray], int]:
+        if len(self._sys_data) == 0:
+            return None, 0
+        with self._lock:
+            data = np.concatenate(self._sys_data, axis=0)
+        return data.copy(), self._sys_samplerate
+
+    def get_mixed_audio(self) -> Tuple[Optional[np.ndarray], int]:
+        mic_data, mic_sr = self.get_mic_audio()
+        sys_data, sys_sr = self.get_system_audio()
+
+        if mic_data is None and sys_data is None:
+            return None, 0
+
+        target_sr = self._sample_rate
+        target_channels = self._channels
+
+        def prepare(data, sr):
+            if data is None:
+                return None
+            if data.ndim == 1:
+                data = np.column_stack([data, data])
+            if sr != target_sr:
+                data = self._resample_audio(data, sr, target_sr)
+            return data
+
+        mic_ready = prepare(mic_data, mic_sr)
+        sys_ready = prepare(sys_data, sys_sr)
+
+        mixed = None
+        if mic_ready is not None and sys_ready is not None:
+            mixed = 0.55 * mic_ready + 0.55 * sys_ready
+        elif mic_ready is not None:
+            mixed = mic_ready
+        elif sys_ready is not None:
+            mixed = sys_ready
+
+        if mixed is not None:
+            mixed = np.clip(mixed, -0.99, 0.99)
+        return mixed, target_sr
